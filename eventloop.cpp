@@ -1,265 +1,208 @@
 
+#include "eventloop.h"
+#include <chrono>
 #include <vector>
 #include <map>
-#include <chrono>
 #include <algorithm>
 #include <string.h>
-#include "eventloop.h"
 
 namespace lynx {
-
 using std::chrono::system_clock;
 using std::chrono::duration;
+using std::chrono::duration_cast;
 
-struct IoEvent {
-    IoMode mode;
-    std::function<void()> i_proc; 
-    std::function<void()> o_proc; 
+class Poller
+{
+public:
+    enum {
+        in  = 1,
+        out = 2,
+    };
+
+    virtual ~Poller() {}
+    virtual bool resize(size_t size)   = 0;
+    virtual bool add_event(int fd, int mask) = 0;
+    virtual void del_event(int fd, int mask) = 0;
+    virtual void poll(struct timeval *) = 0;
 };
 
-struct TimeEvent {
-    long long                 id;     //time event identifier
-    system_clock::time_point  when;
-    std::function<int ()>    time_proc;
+struct TimerHandle {
+    size_t                   counts;
+    long long                interval;
+    system_clock::time_point when;
+    EventLoop::TimerFn       proc;
 };
 
-// impl of eventloop
 struct EventLoop::Impl {
-    std::map<int, IoEvent> io_events;
-    std::vector<TimeEvent> timer_events;
-    int         maxfd               = -1;
-    long long   next_timer_id       = 0;
-    bool        stop                = false;
-    std::shared_ptr<Poller> poller  = nullptr;
+    int                     maxfd = -1;
+    long long               next_timer_id = 0;
+    bool                    stop = false;
+    std::shared_ptr<Poller> poller = nullptr;
+    std::map<int, IoFn>     read_fns;
+    std::map<int, IoFn>     write_fns;
+    std::map<long long, TimerHandle> timer_fns;
 };
-
-
-namespace internal {
-} // end of namespace
 
 class SelectPoller : public Poller
 {
 public:
-    SelectPoller(const int& maxfd, const std::map<int, IoEvent>& evts)
-        : maxfd_(maxfd), io_events_(evts) 
+    SelectPoller(const int& maxfd, const std::map<int, EventLoop::IoFn>& read_fns,
+                const std::map<int, EventLoop::IoFn>& write_fns)
+        : maxfd_(maxfd), read_fns_(read_fns), write_fns_(write_fns)
     {
         FD_ZERO(&rfds_);
         FD_ZERO(&wfds_);
     }
 
-    ~SelectPoller() {
+    ~SelectPoller() {}
 
-    }
-
-    bool Resize(size_t size) override {
+    bool resize(size_t size) override {
         return size < FD_SETSIZE;
     }
 
-    bool AddEvent(int fd, IoMode mode) override {
-        if (mode & IoMode::in)  FD_SET(fd, &rfds_);
-        if (mode & IoMode::out) FD_SET(fd, &wfds_);
+    bool add_event(int fd, int mode) override {
+        if (mode & Poller::in)  FD_SET(fd, &rfds_);
+        if (mode & Poller::out) FD_SET(fd, &wfds_);
         return true;
     }
 
-    void DelEvent(int fd, IoMode mode) override {
-        if (mode & IoMode::in)  FD_CLR(fd, &rfds_);
-        if (mode & IoMode::out) FD_CLR(fd, &wfds_);
+    void del_event(int fd, int mode) override {
+        if (mode & Poller::in)  FD_CLR(fd, &rfds_);
+        if (mode & Poller::out) FD_CLR(fd, &wfds_);
     }
 
-    void Poll(struct timeval *tvp, 
-            const std::function<void (int, IoMode)>& process) override {
+    void poll(struct timeval *tvp) override {
         fd_set rfds, wfds;
         memcpy(&rfds, &rfds_, sizeof(fd_set));
         memcpy(&wfds, &wfds_, sizeof(fd_set));
 
         int retval = select(maxfd_+1, &rfds, &wfds, nullptr, tvp);
         if (retval > 0) {
-            std::vector<std::pair<int, IoMode>> toprocess;
-            // find all io events
-            for (const auto &kv : io_events_) {
-                int mode = 0;
-                int fd = kv.first;
-                const IoEvent& io = kv.second;
-
-                if (io.mode & IoMode::in && FD_ISSET(fd, &rfds))
-                    mode = IoMode::in;
-                if (io.mode & IoMode::out && FD_ISSET(fd, &wfds))
-                    mode = IoMode::out;
-
-                if (mode != 0) 
-                    toprocess.push_back(std::make_pair(fd, (IoMode)mode));
+            // find all read events
+            for (const auto &kv : read_fns_) {
+                if (FD_ISSET(kv.first, &rfds))
+                    kv.second();
             }
-            
-            // process all events
-            for (const auto& v: toprocess) {
-                process(v.first, v.second);
+
+            // find all write events
+            for (const auto &kv : write_fns_) {
+                if (FD_ISSET(kv.first, &wfds))
+                    kv.second();
             }
         }
     }
 private:
     fd_set rfds_, wfds_;
-    const int &maxfd_;
-    const std::map<int, IoEvent>& io_events_;
+    const int&                             maxfd_;
+    const std::map<int, EventLoop::IoFn>&  read_fns_;
+    const std::map<int, EventLoop::IoFn>&  write_fns_;
 };
 
-EventLoop::EventLoop()
-    :impl_(new Impl)
+
+/* * * * * * * * * * * * * * * * * * * *
+ * EventLoop 
+ */
+EventLoop::EventLoop() : impl_(new Impl)
 {
     if (impl_->poller == nullptr) {
-        auto selector = new SelectPoller(impl_->maxfd, impl_->io_events);
-        impl_->poller = std::shared_ptr<Poller>(selector);
+        auto select_poller = new SelectPoller(impl_->maxfd, 
+                                            impl_->read_fns, 
+                                            impl_->write_fns);
+        impl_->poller = std::shared_ptr<Poller>(select_poller);
     }
 }
 
-EventLoop::~EventLoop() {}
+EventLoop::~EventLoop() { }
+void EventLoop::start() { while(!impl_->stop) process_evts(); }
+void EventLoop::stop()  { impl_->stop = true; }
 
-void EventLoop::Start()
+void EventLoop::process_evts()
 {
-    while (!impl_->stop) {
-        ProcessEvents();
-    }
-}
+    auto &time_evts = impl_->timer_fns;
 
-void EventLoop::Stop() 
-{
-    impl_->stop = true;
-}
+    // sleep until events coming 
+    struct timeval tv, *tvp = nullptr;
+    auto cmp = [](const std::pair<long long, TimerHandle>& a, 
+                  const std::pair<long long, TimerHandle>& b) {
+        return a.second.when < b.second.when;
+    };
+    auto shortest = std::min_element(time_evts.begin(), 
+                                     time_evts.end(),
+                                     cmp);
 
-void EventLoop::ProcessEvents()
-{
-    auto &timer_events = impl_->timer_events;
-
-    if (impl_->maxfd != -1) {
-        struct timeval *tvp = nullptr;
-        struct timeval tv;
-
-        auto f = [](const TimeEvent &a, const TimeEvent& b) -> bool {
-            return a.when < b.when;
-        };
-        auto shortest = std::min_element(timer_events.begin(),
-                                         timer_events.end(), f);
-
-        if (shortest != timer_events.end()) {
-            //shortest->when
-            auto ms = std::chrono::duration_cast<std::chrono::milliseconds> (
-                        shortest->when.time_since_epoch()
-                    );
-            tv.tv_sec  = ms.count()/1000;
-            tv.tv_usec = (ms.count()%1000)*1000;
-            tvp = &tv;
-        }
-        // poll io event
-        impl_->poller->Poll(tvp, [&](int fd, IoMode mode) {
-                const auto iter = impl_->io_events.find(fd);
-                if (iter == impl_->io_events.end()) return;
-                const auto& evt = iter->second;
-
-                bool bin = false;
-                if (evt.mode & mode & IoMode::in) {
-                    bin = true;
-                    evt.i_proc();
-                }
-                if (evt.mode & mode & IoMode::out) {
-                    //if(!bin || evt.i_proc != evt.o_proc)
-                        evt.o_proc();
-                }
-        });
+    if (shortest != time_evts.end()) {
+        //shortest->when
+        auto now = system_clock::now();
+        auto ms = duration_cast<std::chrono::milliseconds>(
+                     shortest->second.when - now
+                );
+        int ms_count = ms.count();
+        if (ms_count < 0) ms_count = 0;
+        tv.tv_sec  = ms.count()/1000;
+        tv.tv_usec = (ms.count()%1000)*1000;
+        tvp = &tv;
     }
 
-    // process time event
+    // poll io event
+    impl_->poller->poll(tvp);
+
+    // process timer events
     auto now = system_clock::now();
-    for (auto &te: timer_events) {
-        if (te.when < now) {
-            int id     = te.id;
-            int retval = te.time_proc();
-
-            if (retval >= 0) {
-                te.when += duration<int, std::milli>(retval);
-            } else {
-                DeleteTimeEvent(id);
-            }
+    std::vector<long long> to_remove;
+    for (auto &te: time_evts) {
+        auto &th = te.second;
+        if (th.when < now) {
+            th.when += duration<int, std::milli>(th.interval);
+            th.proc(te.first);
+            if (th.counts != lynx::MATH_HUGE) th.counts--;
+            if (th.counts == 0) to_remove.push_back(te.first);
         }
     }
+    for (auto id: to_remove) del_timer_id(id);
 }
 
-bool EventLoop::createIOEventImpl(int fd, IoMode mask, 
-                    const std::function<void ()>& f)
+void EventLoop::async_read_impl(int fd, const IoFn& fn) 
 {
-    if (!impl_->poller->AddEvent(fd, mask))
-        return false;
-
-    auto &evts = impl_->io_events;
-    if (evts.end() == evts.find(fd)) {
-        IoEvent io {
-            .mode = mask,
-        };
-
-        if (mask & IoMode::in)  io.i_proc = f;
-        if (mask & IoMode::out) io.o_proc = f;
-        evts.insert(std::make_pair(fd, io));
-    } else {
-        auto &io = evts.at(fd);
-        io.mode = (IoMode)(io.mode | mask);
-        if (mask & IoMode::in)  io.i_proc = f;
-        if (mask & IoMode::out) io.o_proc = f;
-    }
-
-    if (fd > impl_->maxfd) impl_->maxfd = fd;
-    return true;
+    if (impl_->poller->add_event(fd, Poller::in)) return;
+    impl_->read_fns[fd] = fn;
 }
 
-void EventLoop::DeleteFileEvent(int fd, IoMode mask)
+void EventLoop::async_write_impl(int fd, const IoFn& fn)
 {
-    auto &evts = impl_->io_events;
-    auto iter = evts.find(fd);
-    if (iter == evts.end()) return;
-
-    auto &io = iter->second;
-    impl_->poller->DelEvent(fd, mask);
-    io.mode = (IoMode)(io.mode & (~mask));
-    if ((int)io.mode == 0) {
-        evts.erase(iter);
-
-        // update max fd
-        if (fd == impl_->maxfd) {
-            auto f = [](const std::pair<int, IoEvent>& a,
-                        const std::pair<int, IoEvent>& b) {
-                return a.first < b.first;
-            };
-            auto iter = std::max_element(evts.begin(), evts.end(), f);
-            if (iter != evts.end())
-                impl_->maxfd = iter->first;
-        }
-    }
+    if (impl_->poller->add_event(fd, Poller::out)) return;
+    impl_->write_fns[fd] = fn;
 }
 
-void EventLoop::DeleteTimeEvent(long long id)
+long long EventLoop::every_impl(long long ms, size_t times, const TimerFn& fn)
 {
-    auto &tes = impl_->timer_events;
-    auto comp = [id](const TimeEvent& te) -> bool {
-                return te.id == id;
-    };
-    auto iter = std::find_if(tes.begin(), tes.end(), comp);
-    if (iter != tes.end()) {
-        tes.erase(iter);
-    }
-}
+    auto id = impl_->next_timer_id++; 
+    auto w  = system_clock::now() + duration<int, std::milli>(ms);
+    TimerHandle th { times, ms, w, fn };
 
-long long EventLoop::createTimeEventImpl(long long ms,
-                    const std::function<int ()>& f) 
-{
-    long long id = impl_->next_timer_id++;
-    auto w = system_clock::now() + duration<int, std::milli>(ms);
-
-    TimeEvent te {
-        .id         = id,
-        .when       = w,
-        .time_proc  = f,
-    };
-    impl_->timer_events.push_back(te);
-
+    impl_->timer_fns[id] = th; 
     return id;
 }
 
+void EventLoop::del_async_read_fn(int fd) 
+{
+    auto iter = impl_->read_fns.find(fd);
+    if (iter != impl_->read_fns.end())
+        impl_->read_fns.erase(iter);
+}
 
-} // end of namespace lynx
+void EventLoop::del_async_write_fn(int fd) 
+{
+    auto iter = impl_->write_fns.find(fd);
+    if (iter != impl_->write_fns.end())
+        impl_->write_fns.erase(iter);
+}
+
+void EventLoop::del_timer_id(long long id) 
+{ 
+    auto &time_evts = impl_->timer_fns;
+    auto iter = time_evts.find(id);
+    if (iter != time_evts.end()) time_evts.erase(iter);
+}
+
+} // end namespace lynx
+

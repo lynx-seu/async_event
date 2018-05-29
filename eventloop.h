@@ -1,72 +1,68 @@
 
 #pragma once
 
-#include <memory>
 #include <functional>
-
-// ** forward declaration
-struct timeval;
+#include <memory>
+#include <climits>
 
 namespace lynx {
 
-enum IoMode {
-    in    = 1,
-    out   = 2,
+// simulate infinity value
+enum {
+    MATH_HUGE = UINT_MAX,
 };
 
-enum Events {
-    file = 1,
-    time = 2,
-    all  = (file | time),
-};
-
-class Poller
-{
+// async event loop && timer
+class EventLoop final {
 public:
-    virtual ~Poller() {}
-    virtual bool Resize(size_t size)   = 0;
-    virtual bool AddEvent(int fd, IoMode mode) = 0;
-    virtual void DelEvent(int fd, IoMode mode) = 0;
-    virtual void Poll(struct timeval *, const std::function<void (int, IoMode)>&) = 0;
-};
+    using IoFn      = std::function<void ()>;
+    using TimerFn   = std::function<void (long long)>;
 
-class EventLoop final
-{
-public:
     EventLoop();
     ~EventLoop();
-    EventLoop& operator=(const EventLoop&) = delete;
-    EventLoop(const EventLoop&) = delete;
 
-    void Start();
-    void ProcessEvents();
-    void Stop();
+    void start();
+    void stop();
+    void process_evts();
 
-    // io event
-    template<class Func, class... Args>
-    bool CreateIOEvent(int fd, IoMode mask, Func func, Args... args) {
-        auto f = std::bind(std::forward<Func>(func), fd,
-                           std::forward<Args>(args)...);
-        return createIOEventImpl(fd, mask, f);
+    template<class F, class... Args>
+    inline void async_read(int fd, F&& f, Args&&... args) {
+        auto io_fn = std::bind(std::forward<F>(f), fd,
+                            std::forward<Args>(args)...);
+        async_read_impl(fd, io_fn);
     }
-    void DeleteFileEvent(int fd, IoMode mode);
 
-    // timer
-    template<class Func, class... Args>
-    long long CreateTimeEvent(long long ms, Func func, Args... args) {
-        auto f = std::bind(std::forward<Func>(func),
-                           std::forward<Args>(args)...);
-        return createTimeEventImpl(ms, f);
+    template<class F, class... Args>
+    inline void async_write(int fd, F&& f, Args&&... args) {
+        auto io_fn = std::bind(std::forward<F>(f), fd,
+                            std::forward<Args>(args)...);
+        async_write_impl(fd, io_fn);
     }
-    void DeleteTimeEvent(long long id);
+
+    template<class F, class... Args>
+    inline long long every(long long ms, size_t times, F&& f, Args&&... args) {
+        TimerFn timer_fn = std::bind(std::forward<F>(f), std::placeholders::_1,
+                                std::forward<Args>(args)...);
+        return every_impl(ms, times, timer_fn);
+    }
+
+    template<class F, class... Args>
+    inline long long after(long long ms, F&& f, Args&&... args) {
+        return every(ms, 1, std::forward<F>(f), std::forward<Args>(args)...);
+    }
+
+    void del_async_read_fn(int fd);
+    void del_async_write_fn(int fd);
+    void del_timer_id(long long id);
+private:
+    void async_read_impl(int fd, const IoFn& fn);
+    void async_write_impl(int fd, const IoFn& fn);
+    long long every_impl(long long ms, size_t times, const TimerFn& fn);
 
 private:
-    bool createIOEventImpl(int fd, IoMode mask, const std::function<void ()>& f);
-    long long createTimeEventImpl(long long ms, const std::function<int ()>& f);
-
-private:
+    // follow: [pimpl idiom](https://docs.microsoft.com/en-us/cpp/cpp/pimpl-for-compile-time-encapsulation-modern-cpp)
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+} // end namespace lynx
 
-} /* end namespace lynx */
